@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Represents a user profile with their preferred name.",
+      "type": "object",
+      "properties": {
+        "displayName": { "type": "string" },
+        "email": { "type": "string", "format": "email" }
+      },
+      "required": ["displayName", "email"]
+    },
+    "Shift": {
+      "title": "Shift",
+      "description": "Represents a work shift with assigned employees and relay types.",
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The date of the shift."
+        },
+        "configType": {
+          "type": "string",
+          "enum": ["2-employees", "3-employees"],
+          "description": "The configuration of the shift."
+        },
+        "assignments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "employeeName": { "type": "string" },
+              "relayType": { "type": "string", "enum": ["fini", "shot", "tard"] }
+            },
+            "required": ["employeeName", "relayType"]
+          },
+          "description": "List of employees and their assigned relay types."
+        },
+        "employeeNames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of employee names for easier querying."
+        },
+        "createdBy": {
+          "type": "string",
+          "description": "The UID of the user who created the entry."
+        }
+      },
+      "required": ["date", "configType", "assignments", "employeeNames", "createdBy"]
+    }
+  },
+  "firestore": {
+    "/shifts/{shiftId}": {
+      "schema": "Shift",
+      "description": "Collection of work shifts."
+    }
+  }
+}

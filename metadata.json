@@ -1,0 +1,5 @@
+{
+  "name": "Mes spellos",
+  "description": "Application de suivi des relais de travail stockant les données dans Google Sheets, avec calendrier et recherche par employé.",
+  "requestFramePermissions": []
+}
