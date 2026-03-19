@@ -8,7 +8,9 @@ import {
   GoogleAuthProvider,
   User
 } from './firebase';
+import { authService } from './services/authService';
 import { googleSheetsService } from './services/googleSheetsService';
+import { storageService } from './services/storageService';
 import { 
   format, 
   startOfMonth, 
@@ -36,7 +38,9 @@ import {
   Trash2, 
   Edit2,
   AlertCircle,
-  Settings
+  Settings,
+  Cloud,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -107,15 +111,47 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(localStorage.getItem('google_access_token'));
   const [spreadsheetId, setSpreadsheetId] = useState<string | null>(localStorage.getItem('google_spreadsheet_id'));
-  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(storageService.getProfile());
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const [shifts, setShifts] = useState<Shift[]>([]);
+  const [shifts, setShifts] = useState<Shift[]>(storageService.getShifts());
   const [activeTab, setActiveTab] = useState<'calendar' | 'search' | 'settings'>('calendar');
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingShift, setEditingShift] = useState<Shift | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isGisLoaded, setIsGisLoaded] = useState(false);
+
+  // GIS Initialization
+  useEffect(() => {
+    const initGis = async () => {
+      try {
+        await authService.loadGisScript();
+        authService.initTokenClient((response) => {
+          if (response.access_token) {
+            console.log("GIS Token received");
+            setAccessToken(response.access_token);
+            localStorage.setItem('google_access_token', response.access_token);
+            setInitError(null);
+          } else if (response.error) {
+            console.error("GIS Auth Error:", response.error, response.error_description);
+            let msg = "Erreur d'authentification Google.";
+            if (response.error === 'access_denied') msg = "L'accès a été refusé. Veuillez autoriser l'application.";
+            if (response.error === 'invalid_client') msg = "Configuration OAuth invalide (Client ID).";
+            if (response.error === 'redirect_uri_mismatch') msg = "L'URL de redirection ne correspond pas à la configuration.";
+            setInitError(msg);
+          }
+        });
+        setIsGisLoaded(true);
+      } catch (error) {
+        console.error("GIS Script load failed", error);
+        setInitError("Impossible de charger le script d'authentification Google.");
+      }
+    };
+    initGis();
+  }, [user]);
 
   // Auth Listener
   useEffect(() => {
@@ -132,14 +168,104 @@ export default function App() {
     return unsubscribe;
   }, []);
 
+  // Sync Logic
+  const syncData = useCallback(async () => {
+    if (!accessToken || !spreadsheetId || isSyncing) return;
+    
+    const localShifts = storageService.getShifts();
+    const pendingShifts = localShifts.filter(s => s.syncStatus && s.syncStatus !== 'synced');
+    const localProfile = storageService.getProfile();
+    const isProfilePending = localProfile?.syncStatus === 'pending';
+    
+    if (pendingShifts.length === 0 && !isProfilePending) return;
+    
+    setIsSyncing(true);
+    try {
+      // Sync Profile first
+      if (isProfilePending && localProfile) {
+        await googleSheetsService.saveProfile(accessToken, spreadsheetId, localProfile);
+        const updatedProfile = { ...localProfile, syncStatus: 'synced' as const };
+        storageService.saveProfile(updatedProfile);
+        setUserProfile(updatedProfile);
+      }
+
+      // Sync Shifts
+      for (const shift of pendingShifts) {
+        if (shift.syncStatus === 'pending_save') {
+          await googleSheetsService.saveShift(accessToken, spreadsheetId, shift);
+        } else if (shift.syncStatus === 'pending_delete') {
+          await googleSheetsService.deleteShift(accessToken, spreadsheetId, shift.date);
+        }
+      }
+      
+      // After successful sync, refresh from remote to ensure consistency
+      const remoteShifts = await googleSheetsService.getShifts(accessToken, spreadsheetId);
+      const merged = storageService.mergeShifts(remoteShifts);
+      setShifts(merged);
+      
+      // Also refresh profile
+      const remoteProfile = await googleSheetsService.getProfile(accessToken, spreadsheetId);
+      if (remoteProfile) {
+        const fullProfile = { ...remoteProfile, syncStatus: 'synced' as const };
+        storageService.saveProfile(fullProfile);
+        setUserProfile(fullProfile);
+      }
+      
+      setInitError(null);
+    } catch (error: any) {
+      console.error("Sync failed", error);
+      if (error.status === 401) {
+        console.log("Token expired during sync, refreshing...");
+        authService.requestAccessToken('none');
+      }
+      // Don't block the user, just keep the pending status
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [accessToken, spreadsheetId, isSyncing]);
+
+  // Periodic Sync
+  useEffect(() => {
+    const interval = setInterval(syncData, 30000); // Try to sync every 30 seconds
+    return () => clearInterval(interval);
+  }, [syncData]);
+
+  // Sync when coming back online
+  useEffect(() => {
+    window.addEventListener('online', syncData);
+    return () => window.removeEventListener('online', syncData);
+  }, [syncData]);
+
   // Initialize Sheets
   useEffect(() => {
     const initSheets = async () => {
       if (!user || !accessToken) return;
       
-      setIsLoading(true);
+      setInitError(null);
+      // Don't set isLoading to true if we already have local data to show
+      const hasLocalData = shifts.length > 0;
+      if (!hasLocalData) setIsLoading(true);
+
       try {
         let sid = spreadsheetId;
+        
+        // If we have a sid, verify it's accessible
+        if (sid) {
+          try {
+            await googleSheetsService.getShifts(accessToken, sid);
+          } catch (e: any) {
+            console.warn("Stored spreadsheet ID is invalid or inaccessible, searching for a new one.", e);
+            if (e.status === 401) {
+              console.log("Token expired during init, refreshing...");
+              authService.requestAccessToken('none');
+              return;
+            }
+            sid = null;
+            setSpreadsheetId(null);
+            localStorage.removeItem('google_spreadsheet_id');
+          }
+        }
+
         if (!sid) {
           sid = await googleSheetsService.getSpreadsheetId(accessToken);
           if (!sid) {
@@ -153,20 +279,29 @@ export default function App() {
         const profile = await googleSheetsService.getProfile(accessToken, sid);
         if (profile) {
           setUserProfile(profile);
+          storageService.saveProfile(profile);
         } else {
           const initialProfile = { displayName: user.displayName || '', email: user.email || '' };
           await googleSheetsService.saveProfile(accessToken, sid, initialProfile);
-          setUserProfile({ uid: 'google-sheets', ...initialProfile });
+          const fullProfile = { uid: 'google-sheets', ...initialProfile };
+          setUserProfile(fullProfile);
+          storageService.saveProfile(fullProfile);
         }
 
-        // Load shifts
+        // Load shifts and merge
         const fetchedShifts = await googleSheetsService.getShifts(accessToken, sid);
-        setShifts(fetchedShifts);
-      } catch (error) {
+        const merged = storageService.mergeShifts(fetchedShifts);
+        setShifts(merged);
+        
+        // Trigger initial sync for any pending local changes
+        syncData();
+      } catch (error: any) {
         console.error("Failed to initialize sheets", error);
-        // If 401, token might be expired
-        if ((error as any).status === 401) {
-          handleLogout();
+        if (error.status === 401) {
+          console.log("Token expired during init, refreshing...");
+          authService.requestAccessToken('none');
+        } else {
+          setInitError("Mode hors-ligne : Connexion Google Sheets indisponible.");
         }
       } finally {
         setIsLoading(false);
@@ -176,25 +311,38 @@ export default function App() {
     if (isAuthReady && user && accessToken) {
       initSheets();
     }
-  }, [isAuthReady, user, accessToken]);
+  }, [isAuthReady, user, accessToken, spreadsheetId]);
 
   const handleLogin = async () => {
+    if (!isGisLoaded) {
+      setInitError("Le service d'authentification n'est pas encore prêt.");
+      return;
+    }
+    
     try {
-      const result = await signInWithPopup(auth, googleProvider);
-      const credential = GoogleAuthProvider.credentialFromResult(result);
-      const token = credential?.accessToken;
-      if (token) {
-        setAccessToken(token);
-        localStorage.setItem('google_access_token', token);
+      // First ensure Firebase auth is done (for identity)
+      if (!user) {
+        await signInWithPopup(auth, googleProvider);
       }
-    } catch (error) {
+      
+      // Then request GIS token for Sheets access
+      authService.requestAccessToken('consent');
+    } catch (error: any) {
       console.error("Login failed", error);
+      if (error.code === 'auth/popup-blocked') {
+        setInitError("Le popup de connexion a été bloqué par votre navigateur.");
+      } else {
+        setInitError(`Échec de la connexion: ${error.message}`);
+      }
     }
   };
 
   const handleLogout = async () => {
     try {
       await signOut(auth);
+      if (accessToken) {
+        authService.revokeToken(accessToken);
+      }
       setAccessToken(null);
       setSpreadsheetId(null);
       localStorage.removeItem('google_access_token');
@@ -208,10 +356,37 @@ export default function App() {
     if (!accessToken || !spreadsheetId) return;
     try {
       const fetchedShifts = await googleSheetsService.getShifts(accessToken, spreadsheetId);
-      setShifts(fetchedShifts);
+      const merged = storageService.mergeShifts(fetchedShifts);
+      setShifts(merged);
     } catch (error) {
       console.error("Failed to refresh shifts", error);
     }
+  };
+
+  const handleSaveShift = async (shiftData: Omit<Shift, 'id'>) => {
+    // Optimistic local save
+    const newShift: Shift = { ...shiftData, syncStatus: 'pending_save' };
+    const updatedShifts = storageService.updateShift(newShift);
+    setShifts([...updatedShifts]);
+    
+    // Attempt background sync
+    syncData();
+  };
+
+  const handleDeleteShift = async (date: string) => {
+    // Optimistic local delete
+    const updatedShifts = storageService.deleteShift(date);
+    setShifts([...updatedShifts]);
+    
+    // Attempt background sync
+    syncData();
+  };
+
+  const handleSaveProfile = async (profile: Partial<UserProfile>) => {
+    const updatedProfile = storageService.updateProfile({ ...profile, syncStatus: 'pending' });
+    setUserProfile(updatedProfile);
+    // Trigger background sync
+    syncData();
   };
 
   if (!isAuthReady || isLoading) {
@@ -257,7 +432,20 @@ export default function App() {
         {/* Header */}
         <header className="bg-white border-b border-stone-200 sticky top-0 z-20">
           <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
-            <h1 className="text-xl font-bold tracking-tight text-accent-navy">Mes spellos</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl font-bold tracking-tight text-accent-navy">Mes spellos</h1>
+              {isSyncing ? (
+                <div className="flex items-center gap-1.5 text-[10px] font-bold text-stone-400 bg-stone-50 px-2 py-1 rounded-full animate-pulse">
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                  <span>SYNCHRONISATION...</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-500 bg-emerald-50 px-2 py-1 rounded-full">
+                  <Cloud className="w-3 h-3" />
+                  <span>À JOUR</span>
+                </div>
+              )}
+            </div>
             <button 
               onClick={handleLogout}
               className="p-2 text-stone-400 hover:text-red-500 transition-colors"
@@ -266,6 +454,20 @@ export default function App() {
               <LogOut className="w-5 h-5" />
             </button>
           </div>
+          {initError && (
+            <div className="bg-red-50 border-t border-red-100 p-3 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-red-600 text-sm font-medium">
+                <AlertCircle className="w-4 h-4" />
+                <span>{initError}</span>
+              </div>
+              <button 
+                onClick={handleLogin}
+                className="text-xs font-bold text-red-700 hover:underline"
+              >
+                Se reconnecter
+              </button>
+            </div>
+          )}
         </header>
 
         <main className="max-w-4xl mx-auto p-4">
@@ -294,7 +496,8 @@ export default function App() {
                 userProfile={userProfile}
                 accessToken={accessToken}
                 spreadsheetId={spreadsheetId}
-                onProfileUpdate={(profile) => setUserProfile(profile)}
+                onProfileUpdate={handleSaveProfile}
+                onReconnect={handleLogin}
               />
             )}
           </AnimatePresence>
@@ -341,14 +544,13 @@ export default function App() {
               date={selectedDate}
               shift={editingShift}
               userProfile={userProfile}
-              accessToken={accessToken}
-              spreadsheetId={spreadsheetId}
               onClose={() => {
                 setIsModalOpen(false);
                 setEditingShift(null);
                 refreshShifts();
               }}
-              userId={user.uid}
+              onSave={handleSaveShift}
+              onDelete={handleDeleteShift}
             />
           )}
         </AnimatePresence>
@@ -443,24 +645,36 @@ function CalendarView({ shifts, userProfile, onDateClick }: {
               </span>
               
               {shift && (
-                <div className="flex flex-wrap justify-center gap-1 mt-auto">
-                  {userAssignment ? (
-                    <div 
-                      className="w-3 h-3 rounded-full border border-black/5"
-                      style={{ backgroundColor: RELAY_COLORS[userAssignment.relayType] }}
-                    />
-                  ) : (
-                    // Fallback if user not found in shift, show all dots small
-                    <div className="flex gap-0.5">
-                      {shift.assignments.map((a, i) => (
-                        <div 
-                          key={i}
-                          className="w-1.5 h-1.5 rounded-full border border-black/5"
-                          style={{ backgroundColor: RELAY_COLORS[a.relayType] }}
-                        />
-                      ))}
-                    </div>
-                  )}
+                <div className="flex flex-col items-center gap-1 mt-auto w-full">
+                  <div className="absolute top-1 right-1 flex gap-1">
+                    {shift.note && (
+                      <div className="w-1.5 h-1.5 bg-accent-navy rounded-full animate-pulse" title="Note présente" />
+                    )}
+                    {shift.syncStatus && shift.syncStatus !== 'synced' && (
+                      <div className="text-amber-500" title="En attente de synchronisation">
+                        <Cloud className="w-3 h-3 animate-bounce" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap justify-center gap-1">
+                    {userAssignment ? (
+                      <div 
+                        className="w-3 h-3 rounded-full border border-black/5"
+                        style={{ backgroundColor: RELAY_COLORS[userAssignment.relayType] }}
+                      />
+                    ) : (
+                      // Fallback if user not found in shift, show all dots small
+                      <div className="flex gap-0.5">
+                        {shift.assignments.map((a, i) => (
+                          <div 
+                            key={i}
+                            className="w-1.5 h-1.5 rounded-full border border-black/5"
+                            style={{ backgroundColor: RELAY_COLORS[a.relayType] }}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </button>
@@ -521,12 +735,29 @@ function SearchView({ shifts, searchQuery, setSearchQuery }: {
                     <h3 className="font-bold text-stone-900">
                       {format(parseISO(shift.date), 'EEEE d MMMM yyyy', { locale: fr })}
                     </h3>
-                    <p className="text-xs text-stone-400 uppercase tracking-wider font-semibold">
-                      {shift.configType === '2-employees' ? '2 Employés' : '3 Employés'}
-                    </p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-stone-400 uppercase tracking-wider font-semibold">
+                        {shift.configType === '2-employees' ? '2 Employés' : '3 Employés'}
+                      </p>
+                      {shift.syncStatus && shift.syncStatus !== 'synced' && (
+                        <div className="flex items-center gap-1 text-[9px] font-bold text-amber-500 bg-amber-50 px-1.5 py-0.5 rounded-md">
+                          <Cloud className="w-2.5 h-2.5" />
+                          <span>EN ATTENTE</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
+              
+              {shift.note && (
+                <div className="p-4 bg-accent-navy/5 rounded-2xl border border-accent-navy/10">
+                  <p className="text-sm text-accent-navy italic">
+                    <span className="font-bold not-italic mr-2">Note:</span>
+                    "{shift.note}"
+                  </p>
+                </div>
+              )}
               
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {shift.assignments.map((a, i) => (
@@ -557,30 +788,33 @@ function SearchView({ shifts, searchQuery, setSearchQuery }: {
   );
 }
 
-function SettingsView({ userProfile, accessToken, spreadsheetId, onProfileUpdate }: { 
+function SettingsView({ userProfile, accessToken, spreadsheetId, onProfileUpdate, onReconnect }: { 
   userProfile: UserProfile | null, 
   accessToken: string | null,
   spreadsheetId: string | null,
-  onProfileUpdate: (profile: UserProfile) => void,
+  onProfileUpdate: (profile: Partial<UserProfile>) => void,
+  onReconnect: () => void,
   key?: string 
 }) {
   const [name, setName] = useState(userProfile?.displayName || '');
+  const [employees, setEmployees] = useState<string[]>(userProfile?.employees || []);
+  const [newEmployee, setNewEmployee] = useState('');
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    if (userProfile) setName(userProfile.displayName);
+    if (userProfile) {
+      setName(userProfile.displayName);
+      setEmployees(userProfile.employees || []);
+    }
   }, [userProfile]);
 
   const handleSave = async () => {
-    if (!accessToken || !spreadsheetId) return;
     setIsSaving(true);
     try {
-      const profile = {
+      await onProfileUpdate({
         displayName: name,
-        email: userProfile?.email || ''
-      };
-      await googleSheetsService.saveProfile(accessToken, spreadsheetId, profile);
-      onProfileUpdate({ uid: 'google-sheets', ...profile });
+        employees: employees
+      });
     } catch (error) {
       console.error("Failed to save profile", error);
     } finally {
@@ -588,13 +822,25 @@ function SettingsView({ userProfile, accessToken, spreadsheetId, onProfileUpdate
     }
   };
 
+  const addEmployee = () => {
+    if (newEmployee.trim() && !employees.includes(newEmployee.trim())) {
+      setEmployees([...employees, newEmployee.trim()]);
+      setNewEmployee('');
+    }
+  };
+
+  const removeEmployee = (emp: string) => {
+    setEmployees(employees.filter(e => e !== emp));
+  };
+
   return (
     <motion.div 
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -20 }}
-      className="max-w-md mx-auto space-y-8"
+      className="max-w-md mx-auto space-y-8 pb-24"
     >
+      {/* Profile Section */}
       <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-6">
         <div className="flex items-center gap-4">
           <div className="w-12 h-12 bg-stone-100 rounded-2xl flex items-center justify-center text-stone-600">
@@ -616,13 +862,94 @@ function SettingsView({ userProfile, accessToken, spreadsheetId, onProfileUpdate
             className="w-full px-4 py-3 bg-stone-50 rounded-2xl border border-stone-100 focus:outline-none focus:ring-2 focus:ring-accent-navy/20 focus:border-accent-navy transition-all"
           />
         </div>
+      </div>
 
+      {/* Employees Section */}
+      <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-6">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 bg-stone-100 rounded-2xl flex items-center justify-center text-stone-600">
+            <Plus className="w-6 h-6" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold">Employés</h2>
+            <p className="text-sm text-stone-400">Gérez la liste de vos collègues.</p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex gap-2">
+            <input 
+              type="text"
+              value={newEmployee}
+              onChange={(e) => setNewEmployee(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && addEmployee()}
+              placeholder="Nom de l'employé..."
+              className="flex-1 px-4 py-3 bg-stone-50 rounded-2xl border border-stone-100 focus:outline-none focus:ring-2 focus:ring-accent-navy/20 focus:border-accent-navy transition-all"
+            />
+            <button 
+              onClick={addEmployee}
+              className="p-3 bg-accent-navy text-white rounded-2xl hover:opacity-90 transition-all"
+            >
+              <Plus className="w-6 h-6" />
+            </button>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {employees.map(emp => (
+              <div 
+                key={emp}
+                className="flex items-center gap-2 px-4 py-2 bg-stone-50 rounded-full border border-stone-100 text-sm font-medium text-stone-700"
+              >
+                <span>{emp}</span>
+                <button 
+                  onClick={() => removeEmployee(emp)}
+                  className="text-stone-400 hover:text-red-500 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            ))}
+            {employees.length === 0 && (
+              <p className="text-sm text-stone-400 italic">Aucun employé ajouté.</p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Google Connection Info */}
+      <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm">
+        <div className="p-4 bg-stone-50 rounded-2xl border border-stone-100">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-stone-600">Connexion Google</span>
+            <span className={cn(
+              "text-xs font-bold px-2 py-1 rounded-md",
+              accessToken && spreadsheetId ? "text-green-600 bg-green-50" : "text-amber-600 bg-amber-50"
+            )}>
+              {accessToken && spreadsheetId ? 'Connecté' : 'Mode Hors-ligne'}
+            </span>
+          </div>
+          <p className="text-xs text-stone-400 mb-4">
+            {accessToken && spreadsheetId 
+              ? 'Votre application est synchronisée avec Google Sheets.' 
+              : 'Les modifications seront enregistrées localement et synchronisées plus tard.'}
+          </p>
+          <button 
+            onClick={onReconnect}
+            className="w-full py-2 text-xs font-bold text-accent-navy bg-accent-navy/5 rounded-xl hover:bg-accent-navy/10 transition-colors"
+          >
+            {accessToken && spreadsheetId ? 'Changer de compte / Reconnecter' : 'Se connecter à Google Sheets'}
+          </button>
+        </div>
+      </div>
+
+      {/* Save Button */}
+      <div className="sticky bottom-0 pt-4 bg-stone-50/80 backdrop-blur-sm">
         <button 
           onClick={handleSave}
           disabled={isSaving}
           className="w-full py-4 bg-accent-navy text-white rounded-2xl font-bold hover:opacity-90 transition-all disabled:opacity-50 shadow-lg shadow-stone-200"
         >
-          {isSaving ? 'Enregistrement...' : 'Enregistrer'}
+          {isSaving ? 'Enregistrement...' : 'Enregistrer les modifications'}
         </button>
       </div>
     </motion.div>
@@ -631,14 +958,13 @@ function SettingsView({ userProfile, accessToken, spreadsheetId, onProfileUpdate
 
 // --- Components ---
 
-function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onClose, userId }: { 
+function ShiftModal({ date, shift, userProfile, onClose, onSave, onDelete }: { 
   date: Date, 
   shift: Shift | null, 
   userProfile: UserProfile | null,
-  accessToken: string | null,
-  spreadsheetId: string | null,
   onClose: () => void,
-  userId: string
+  onSave: (shift: Omit<Shift, 'id'>) => Promise<void>,
+  onDelete: (date: string) => Promise<void>
 }) {
   const [configType, setConfigType] = useState<ConfigType>(shift?.configType || '2-employees');
   const [assignments, setAssignments] = useState<Assignment[]>(
@@ -647,6 +973,7 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
       { employeeName: '', relayType: 'tard' }
     ]
   );
+  const [note, setNote] = useState(shift?.note || '');
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -675,11 +1002,6 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
       return;
     }
 
-    if (!accessToken || !spreadsheetId) {
-      setErrorMessage("Erreur de connexion Google.");
-      return;
-    }
-
     setErrorMessage(null);
     setIsSaving(true);
     const shiftData: Omit<Shift, 'id'> = {
@@ -687,22 +1009,23 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
       configType,
       assignments,
       employeeNames: assignments.map(a => a.employeeName),
-      createdBy: userId
+      createdBy: 'user',
+      note
     };
 
     try {
-      await googleSheetsService.saveShift(accessToken, spreadsheetId, shiftData);
+      await onSave(shiftData);
       onClose();
     } catch (error) {
       console.error("Failed to save shift", error);
-      setErrorMessage("Erreur lors de la sauvegarde dans Google Sheets.");
+      setErrorMessage("Erreur lors de la sauvegarde.");
     } finally {
       setIsSaving(false);
     }
   };
 
   const handleDelete = async () => {
-    if (!shift?.id || !accessToken || !spreadsheetId) return;
+    if (!shift) return;
     
     if (!showDeleteConfirm) {
       setShowDeleteConfirm(true);
@@ -711,11 +1034,11 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
 
     setIsSaving(true);
     try {
-      await googleSheetsService.deleteShift(accessToken, spreadsheetId, shift.date);
+      await onDelete(shift.date);
       onClose();
     } catch (error) {
       console.error("Failed to delete shift", error);
-      setErrorMessage("Erreur lors de la suppression dans Google Sheets.");
+      setErrorMessage("Erreur lors de la suppression.");
     } finally {
       setIsSaving(false);
       setShowDeleteConfirm(false);
@@ -814,17 +1137,36 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
                 <div key={i} className="flex items-center gap-3 p-4 bg-stone-50 rounded-2xl border border-stone-100 group focus-within:border-accent-navy/20 focus-within:bg-white transition-all">
                   <div className="flex-1 space-y-1">
                     <div className="flex items-center justify-between">
-                      <input 
-                        type="text"
-                        placeholder="Nom de l'employé"
-                        value={a.employeeName}
-                        onChange={(e) => {
-                          const newAssignments = [...assignments];
-                          newAssignments[i].employeeName = e.target.value;
-                          setAssignments(newAssignments);
-                        }}
-                        className="w-full bg-transparent font-bold text-stone-900 placeholder:text-stone-300 focus:outline-none"
-                      />
+                      <div className="flex-1">
+                        <input 
+                          type="text"
+                          placeholder="Nom de l'employé"
+                          value={a.employeeName}
+                          onChange={(e) => {
+                            const newAssignments = [...assignments];
+                            newAssignments[i].employeeName = e.target.value;
+                            setAssignments(newAssignments);
+                          }}
+                          className="w-full bg-transparent font-bold text-stone-900 placeholder:text-stone-300 focus:outline-none"
+                        />
+                        {userProfile?.employees && userProfile.employees.length > 0 && !a.employeeName && (
+                          <div className="flex flex-wrap gap-1.5 mt-2">
+                            {userProfile.employees.map(emp => (
+                              <button
+                                key={emp}
+                                onClick={() => {
+                                  const newAssignments = [...assignments];
+                                  newAssignments[i].employeeName = emp;
+                                  setAssignments(newAssignments);
+                                }}
+                                className="text-[9px] font-bold text-stone-500 bg-stone-200/50 px-2 py-0.5 rounded hover:bg-stone-200 transition-colors"
+                              >
+                                {emp}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       {userProfile && a.employeeName.toLowerCase() !== userProfile.displayName.toLowerCase() && (
                         <button 
                           onClick={() => {
@@ -832,7 +1174,7 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
                             newAssignments[i].employeeName = userProfile.displayName;
                             setAssignments(newAssignments);
                           }}
-                          className="text-[10px] font-bold text-accent-navy bg-accent-navy/5 px-2 py-1 rounded-md hover:bg-accent-navy/10 transition-colors"
+                          className="text-[10px] font-bold text-accent-navy bg-accent-navy/5 px-2 py-1 rounded-md hover:bg-accent-navy/10 transition-colors ml-2"
                         >
                           Moi
                         </button>
@@ -861,6 +1203,17 @@ function ShiftModal({ date, shift, userProfile, accessToken, spreadsheetId, onCl
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Note Section */}
+          <div className="space-y-3">
+            <label className="text-xs font-bold text-stone-400 uppercase tracking-wider">Note / Commentaire</label>
+            <textarea
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="Ajouter une note (ex: Hier j'avais fini, donc aujourd'hui c'est tard...)"
+              className="w-full px-4 py-3 bg-stone-50 rounded-2xl border border-stone-100 focus:outline-none focus:ring-2 focus:ring-accent-navy/20 focus:border-accent-navy transition-all min-h-[100px] text-stone-700 placeholder:text-stone-300"
+            />
           </div>
         </div>
 

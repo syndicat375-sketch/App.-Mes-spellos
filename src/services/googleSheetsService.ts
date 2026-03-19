@@ -11,7 +11,7 @@ export interface GoogleSheetsService {
   saveShift(accessToken: string, spreadsheetId: string, shift: Omit<Shift, 'id'>): Promise<void>;
   deleteShift(accessToken: string, spreadsheetId: string, date: string): Promise<void>;
   getProfile(accessToken: string, spreadsheetId: string): Promise<UserProfile | null>;
-  saveProfile(accessToken: string, spreadsheetId: string, profile: Omit<UserProfile, 'uid'>): Promise<void>;
+  saveProfile(accessToken: string, spreadsheetId: string, profile: Omit<UserProfile, 'uid' | 'syncStatus'>): Promise<void>;
 }
 
 export const googleSheetsService: GoogleSheetsService = {
@@ -24,6 +24,14 @@ export const googleSheetsService: GoogleSheetsService = {
         },
       }
     );
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      const error = new Error(errorData.error?.message || 'Failed to fetch spreadsheet ID');
+      (error as any).status = response.status;
+      throw error;
+    }
+
     const data = await response.json();
     if (data.files && data.files.length > 0) {
       return data.files[0].id;
@@ -48,12 +56,24 @@ export const googleSheetsService: GoogleSheetsService = {
         ]
       }),
     });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const error = new Error(errorData.error?.message || 'Failed to create spreadsheet');
+      (error as any).status = response.status;
+      throw error;
+    }
+
     const data = await response.json();
     const spreadsheetId = data.spreadsheetId;
 
+    if (!spreadsheetId) {
+      throw new Error('Spreadsheet ID not returned from Google API');
+    }
+
     // Initialize headers for Shifts
-    await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A1:G1?valueInputOption=USER_ENTERED`,
+    const shiftsHeaderResponse = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A1:H1?valueInputOption=USER_ENTERED`,
       {
         method: 'PUT',
         headers: {
@@ -61,13 +81,17 @@ export const googleSheetsService: GoogleSheetsService = {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          values: [['date', 'employe_1', 'relais_1', 'employe_2', 'relais_2', 'employe_3', 'relais_3']],
+          values: [['date', 'employe_1', 'relais_1', 'employe_2', 'relais_2', 'employe_3', 'relais_3', 'note']],
         }),
       }
     );
 
+    if (!shiftsHeaderResponse.ok) {
+      console.warn('Failed to initialize shifts headers');
+    }
+
     // Initialize headers for Settings
-    await fetch(
+    const settingsHeaderResponse = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SETTINGS_SHEET}!A1:B1?valueInputOption=USER_ENTERED`,
       {
         method: 'PUT',
@@ -81,18 +105,30 @@ export const googleSheetsService: GoogleSheetsService = {
       }
     );
 
+    if (!settingsHeaderResponse.ok) {
+      console.warn('Failed to initialize settings headers');
+    }
+
     return spreadsheetId;
   },
 
   async getShifts(accessToken: string, spreadsheetId: string): Promise<Shift[]> {
     const response = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A2:G`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A2:H`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
         },
       }
     );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const error = new Error(errorData.error?.message || 'Failed to fetch shifts');
+      (error as any).status = response.status;
+      throw error;
+    }
+
     const data = await response.json();
     if (!data.values) return [];
 
@@ -109,6 +145,7 @@ export const googleSheetsService: GoogleSheetsService = {
         employeeNames: assignments.map(a => a.employeeName),
         configType: assignments.length === 3 ? '3-employees' : '2-employees',
         createdBy: 'google-sheets',
+        note: row[7] || '',
       };
     });
   },
@@ -125,12 +162,14 @@ export const googleSheetsService: GoogleSheetsService = {
       shift.assignments[1]?.relayType || '',
       shift.assignments[2]?.employeeName || '',
       shift.assignments[2]?.relayType || '',
+      shift.note || '',
     ];
 
+    let response;
     if (existingIndex !== -1) {
       const rowIndex = existingIndex + 2;
-      await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A${rowIndex}:G${rowIndex}?valueInputOption=USER_ENTERED`,
+      response = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A${rowIndex}:H${rowIndex}?valueInputOption=USER_ENTERED`,
         {
           method: 'PUT',
           headers: {
@@ -143,7 +182,7 @@ export const googleSheetsService: GoogleSheetsService = {
         }
       );
     } else {
-      await fetch(
+      response = await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SHIFTS_SHEET}!A1:append?valueInputOption=USER_ENTERED`,
         {
           method: 'POST',
@@ -157,6 +196,13 @@ export const googleSheetsService: GoogleSheetsService = {
         }
       );
     }
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const error = new Error(errorData.error?.message || 'Failed to save shift');
+      (error as any).status = response.status;
+      throw error;
+    }
   },
 
   async deleteShift(accessToken: string, spreadsheetId: string, date: string): Promise<void> {
@@ -169,10 +215,15 @@ export const googleSheetsService: GoogleSheetsService = {
       const ssResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
+
+      if (!ssResponse.ok) {
+        throw new Error('Failed to fetch spreadsheet metadata for deletion');
+      }
+
       const ssData = await ssResponse.json();
       const sheetId = ssData.sheets.find((s: any) => s.properties.title === SHIFTS_SHEET).properties.sheetId;
 
-      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
+      const deleteResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -193,31 +244,46 @@ export const googleSheetsService: GoogleSheetsService = {
           ],
         }),
       });
+
+      if (!deleteResponse.ok) {
+        const errorData = await deleteResponse.json();
+        throw new Error(errorData.error?.message || 'Failed to delete shift');
+      }
     }
   },
 
   async getProfile(accessToken: string, spreadsheetId: string): Promise<UserProfile | null> {
     const response = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SETTINGS_SHEET}!A2:B2`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SETTINGS_SHEET}!A2:C2`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
         },
       }
     );
+
+    if (!response.ok) {
+      if (response.status === 404) return null;
+      const errorData = await response.json();
+      const error = new Error(errorData.error?.message || 'Failed to fetch profile');
+      (error as any).status = response.status;
+      throw error;
+    }
+
     const data = await response.json();
     if (!data.values || data.values.length === 0) return null;
 
     return {
       uid: 'google-sheets',
-      displayName: data.values[0][0],
-      email: data.values[0][1],
+      displayName: data.values[0][0] || '',
+      email: data.values[0][1] || '',
+      employees: data.values[0][2] ? data.values[0][2].split(',').map((s: string) => s.trim()).filter(Boolean) : [],
     };
   },
 
-  async saveProfile(accessToken: string, spreadsheetId: string, profile: Omit<UserProfile, 'uid'>): Promise<void> {
-    await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SETTINGS_SHEET}!A2:B2?valueInputOption=USER_ENTERED`,
+  async saveProfile(accessToken: string, spreadsheetId: string, profile: Omit<UserProfile, 'uid' | 'syncStatus'>): Promise<void> {
+    const response = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${SETTINGS_SHEET}!A2:C2?valueInputOption=USER_ENTERED`,
       {
         method: 'PUT',
         headers: {
@@ -225,9 +291,14 @@ export const googleSheetsService: GoogleSheetsService = {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          values: [[profile.displayName, profile.email]],
+          values: [[profile.displayName, profile.email, (profile.employees || []).join(', ')]],
         }),
       }
     );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || 'Failed to save profile');
+    }
   },
 };

@@ -8,17 +8,22 @@ export interface Assignment {
 
 export interface Shift {
   id?: string;
+  localId?: string; // For offline tracking
   date: string; // ISO 8601
   configType: ConfigType;
   assignments: Assignment[];
   employeeNames: string[];
   createdBy: string;
+  note?: string;
+  syncStatus?: 'synced' | 'pending_save' | 'pending_delete';
 }
 
 export interface UserProfile {
   uid: string;
   displayName: string;
   email: string;
+  employees?: string[];
+  syncStatus?: 'synced' | 'pending';
 }
 
 export const RELAY_COLORS: Record<RelayType, string> = {
